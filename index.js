@@ -8,26 +8,21 @@ const app = express();
 app.use(express.json());
 
 // ====== ENV ======
-const NHL_HOOK = process.env.DISCORD_WEBHOOK_NHL; // <-- webhook Discord (Render > Variables)
+const NHL_HOOK = process.env.DISCORD_WEBHOOK_NHL; // <-- ton webhook Discord Render
 if (!NHL_HOOK) {
-  console.warn("⚠️ DISCORD_WEBHOOK_NHL manquant dans les variables d'environnement Render.");
+  console.warn("⚠️ DISCORD_WEBHOOK_NHL manquant dans Render.");
 }
 
 // ====== UTILS ======
 function nowParisDate() {
-  return new Date(); // on utilise Date en UTC et on affiche en Paris via toLocaleString
+  return new Date();
 }
 function fmtParis(d) {
   return d.toLocaleString("fr-FR", { timeZone: "Europe/Paris" });
 }
-function pad2(n) {
-  return n.toString().padStart(2, "0");
-}
 function ymdParis(d) {
-  // YYYY-MM-DD en fuseau Europe/Paris
   const s = fmtParis(d);
-  // s ~ "18/10/2025, 20:11:23"
-  const [date] = s.split(","); // "18/10/2025"
+  const [date] = s.split(",");
   const [dd, mm, yyyy] = date.split("/");
   return `${yyyy}-${mm}-${dd}`;
 }
@@ -35,42 +30,29 @@ function diffMinSigned(targetDate, nowDate) {
   return Math.round((targetDate.getTime() - nowDate.getTime()) / 60000);
 }
 
-// ====== NHL SCHEDULE ======
-// Source très stable: https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
+// ====== NHL SCHEDULE (version stable) ======
+// Source : https://statsapi.web.nhl.com/api/v1/schedule?date=YYYY-MM-DD
 async function fetchNhlSchedule(dateStr) {
-  const url = `https://api-web.nhle.com/v1/schedule/${dateStr}`;
+  const url = `https://statsapi.web.nhl.com/api/v1/schedule?date=${dateStr}`;
   const res = await fetch(url, { timeout: 15000 });
   if (!res.ok) throw new Error(`NHL schedule HTTP ${res.status}`);
-  return res.json();
+  const json = await res.json();
+
+  const games = json.dates?.[0]?.games || [];
+  return games.map(g => ({
+    id: g.gamePk,
+    away: g.teams?.away?.team?.abbreviation || g.teams?.away?.team?.name || "AWY",
+    home: g.teams?.home?.team?.abbreviation || g.teams?.home?.team?.name || "HOME",
+    startUTC: g.gameDate,
+    startDate: new Date(g.gameDate),
+    startParis: new Date(g.gameDate).toLocaleString("fr-FR", { timeZone: "Europe/Paris" }),
+    state: g.status?.abstractGameState || "FUT",
+  }));
 }
 
-// Normalise la journée (objets match minimalistes)
 async function getScheduleParisDay(now = nowParisDate()) {
   const dateStr = ymdParis(now);
-  const raw = await fetchNhlSchedule(dateStr);
-
-  // raw.games: [{ id, startTimeUTC, gameState, awayTeam, homeTeam, ... }]
-  const games = (raw?.gameWeek?.[0]?.games || raw?.games || []).map(g => {
-    const startUTC = g.startTimeUTC || g.startUtc || g.startTime || g.startTimeUTCStr || g.startTimeUTCISO || g.startTimeUTCZ || g.startTimeUTCDate;
-    const startDate = new Date(startUTC);
-    const startParis = new Date(startDate.getTime())
-      .toLocaleString("fr-FR", { timeZone: "Europe/Paris" });
-
-    const away = g.awayTeam?.abbrev || g.awayTeam?.triCode || g.awayTeam?.name || "AWY";
-    const home = g.homeTeam?.abbrev || g.homeTeam?.triCode || g.homeTeam?.name || "HOME";
-    const state = g.gameState || g.state || "FUT";
-
-    return {
-      id: g.id ?? g.gamePk ?? `${away}@${home}`,
-      away,
-      home,
-      startUTC,
-      startDate,
-      startParis,
-      state,
-    };
-  });
-
+  const games = await fetchNhlSchedule(dateStr);
   return games;
 }
 
@@ -95,13 +77,8 @@ async function postToDiscord(payload) {
 }
 
 // ====== FENÊTRE “PROCHAIN PUCK” ======
-// On mémorise les startUTC déjà envoyés pour éviter les doublons
 const sentStarts = new Set();
 
-/**
- * Retourne infos fenêtre pour le prochain match qui n’a pas encore commencé (tolérance -15 min).
- * windowOk = dans [0..90] minutes ET ≤ 6h ET pas déjà envoyé.
- */
 function pickNextWindow(games, now) {
   const upcoming = games
     .filter(g => g.startDate.getTime() >= now.getTime() - 15 * 60 * 1000)
@@ -123,12 +100,9 @@ function pickNextWindow(games, now) {
   };
 }
 
-// ====== MESSAGE BUILDER (simple pour l’instant) ======
+// ====== MESSAGE BUILDER ======
 function buildPrematchMessage(gamesWindow, now) {
-  // On prépare un pack minimal (tu enrichiras ensuite avec tes stats/xG/PP/PK etc.)
   const lines = [];
-
-  // On liste tous les matchs qui commencent dans ~6h
   const within6h = gamesWindow
     .filter(g => {
       const m = diffMinSigned(g.startDate, now);
@@ -144,9 +118,7 @@ function buildPrematchMessage(gamesWindow, now) {
     lines.push(...within6h);
   }
 
-  // Préfixe spécial pour que ton relay Discord poste au bon salon
   const header = `[DISCORD:NHL] ⏰ SmartScout — Pré-match NHL (auto)`;
-
   return `${header}\n${lines.join("\n")}`;
 }
 
@@ -159,7 +131,6 @@ app.post("/post", async (req, res) => {
   res.json({ ok: r.ok });
 });
 
-// Diagnostic : pourquoi ça n’envoie pas ?
 app.get("/prematch/why", async (_req, res) => {
   try {
     const now = nowParisDate();
@@ -184,7 +155,6 @@ app.get("/prematch/why", async (_req, res) => {
   }
 });
 
-// Envoi forcé (peu importe la fenêtre)
 app.get("/prematch/force", async (_req, res) => {
   try {
     const now = nowParisDate();
@@ -192,7 +162,6 @@ app.get("/prematch/force", async (_req, res) => {
     const msg = buildPrematchMessage(games, now);
     const r = await postToDiscord({ content: msg });
     if (r.ok) {
-      // on ne marque rien comme “envoyé” ici (c’est volontairement un bypass)
       return res.json({ ok: true, sent: true });
     }
     res.status(500).json({ ok: false, sent: false, reason: r.reason });
@@ -201,7 +170,6 @@ app.get("/prematch/force", async (_req, res) => {
   }
 });
 
-// Cron manuel (pour cliquer) — applique la fenêtre “prochain puck”
 app.get("/cron/manual", async (_req, res) => {
   try {
     const now = nowParisDate();
@@ -230,7 +198,7 @@ app.get("/cron/manual", async (_req, res) => {
   }
 });
 
-// ====== CRON TICK (boucle minute) ======
+// ====== CRON TICK ======
 async function cronTick() {
   try {
     const now = nowParisDate();
@@ -246,9 +214,6 @@ async function cronTick() {
       } else {
         console.log(`[${fmtParis(now)}] Discord error: ${r.reason}`);
       }
-    } else {
-      // logging léger
-      // console.log(`[${fmtParis(now)}] tick: outside window (${window.reason}), minToNext=${window.minToNext ?? "n/a"}`);
     }
   } catch (err) {
     console.error("cronTick error:", err.message);
