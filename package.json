@@ -1,11 +1,11 @@
 {
   "name": "smartscout-nhl-autobot",
-  "version": "1.0.0",
-  "main": "index.js",
+  "version": "1.1.0",
   "type": "module",
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "dayjs": "^1.11.13"
   },
   "scripts": {
     "start": "node index.js"
