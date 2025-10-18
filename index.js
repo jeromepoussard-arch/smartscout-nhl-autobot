@@ -1,172 +1,222 @@
-// ================================
-// SMARTSCOUT NHL AUTOBOT (Render)
-// Version stable + correctifs 502
-// ================================
-
+// index.js
 import express from "express";
 import fetch from "node-fetch";
+
+// ====== CONFIG ======
+const PORT = process.env.PORT || 3000;
+const NHL_HOOK = process.env.DISCORD_WEBHOOK_NHL; // ⚠️ à configurer sur Render
+const FIRST_WINDOW_MIN = 90;                      // fenêtre avant 1er puck
+const H6 = 6 * 60;                                // ~6h
+
+if (!NHL_HOOK) {
+  console.warn("[WARN] DISCORD_WEBHOOK_NHL manquant. Les envois échoueront.");
+}
 
 const app = express();
 app.use(express.json());
 
-// ========= CONFIG =========
-const NHL_HOOK = process.env.DISCORD_WEBHOOK_NHL;
-const FIRST_WINDOW_MIN = 360; // fenêtre 6h avant premier match
-const PREMATCH_TRIGGER_MIN = 90; // envoi auto si premier match <90 min
-
-// ========= UTILITAIRES =========
+// ====== UTILS TEMPS ======
 function nowParis() {
-  return new Date().toLocaleString("fr-FR", { timeZone: "Europe/Paris" });
+  // Objet Date "réel", mais on manipule via toLocaleString pour la TZ
+  return new Date();
 }
-
+function toParisDate(d) {
+  // Construit un Date basé sur l'horodatage Paris (pour comparer en minutes)
+  return new Date(
+    new Date(d).toLocaleString("en-US", { timeZone: "Europe/Paris" })
+  );
+}
 function diffMin(a, b) {
-  return Math.round((new Date(a) - new Date(b)) / 60000);
+  // a et b = Date ; renvoie (a - b) en minutes
+  return Math.round((a.getTime() - b.getTime()) / 60000);
+}
+function formatParis(dt) {
+  return new Date(dt).toLocaleString("fr-FR", {
+    timeZone: "Europe/Paris",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+function formatParisDayISO(d) {
+  // yyyy-mm-dd en date Paris
+  const paris = toParisDate(d);
+  const y = paris.getFullYear();
+  const m = String(paris.getMonth() + 1).padStart(2, "0");
+  const da = String(paris.getDate()).padStart(2, "0");
+  return `${y}-${m}-${da}`;
 }
 
-// ========= FETCH NHL =========
-async function getScheduleParisDay(dateNow) {
-  const iso = new Date(dateNow).toISOString().split("T")[0];
-  const url = `https://api-web.nhle.com/v1/schedule/${iso}`;
-  try {
-    const r = await fetch(url);
-    const data = await r.json();
-    const games = (data.games || []).map(g => ({
-      id: g.id,
-      away: g.awayTeam.abbrev,
-      home: g.homeTeam.abbrev,
-      startUTC: g.startTimeUTC,
-      state: g.gameState,
-    }));
-    return games;
-  } catch (err) {
-    console.error("Erreur API NHL:", err.message);
-    return [];
-  }
-}
-
-// ========= DISCORD =========
+// ====== DISCORD ======
 async function postToDiscord(payload) {
-  if (!NHL_HOOK) {
-    console.error("⚠️ Aucun webhook Discord défini !");
-    return;
-  }
-  try {
-    const res = await fetch(NHL_HOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) throw new Error(`Discord ${res.status}`);
-  } catch (err) {
-    console.error("Erreur Discord:", err.message);
+  if (!NHL_HOOK) throw new Error("DISCORD_WEBHOOK_NHL is undefined");
+  const res = await fetch(NHL_HOOK, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Discord HTTP ${res.status}: ${txt}`);
   }
 }
 
-// ========= GÉNÉRATION PRÉMATCH =========
-async function generatePrematchDiscord() {
+// ====== NHL SCHEDULE (jour Paris) ======
+async function getScheduleParisDay(d = nowParis()) {
+  // API NHL non authentifiée : https://api-web.nhle.com/v1/schedule/YYYY-MM-DD
+  const day = formatParisDayISO(d);
+  const url = `https://api-web.nhle.com/v1/schedule/${day}`;
+
+  const res = await fetch(url, { timeout: 15000 }).catch((e) => {
+    console.error("[NHL] fetch error:", e);
+    throw new Error("Failed to fetch NHL schedule");
+  });
+  if (!res.ok) throw new Error(`NHL schedule HTTP ${res.status}`);
+  const json = await res.json();
+
+  // Normalisation
+  // On renvoie une liste de { id, away, home, startUTC, state }
+  const out = [];
+  const games = json?.gameWeek?.flatMap((w) => w.games) || json?.games || [];
+  for (const g of games) {
+    // Les structures varient selon version; on essaie d'être permissif
+    const id = g.id ?? g.gameId ?? `${g.awayTeam?.abbrev}-${g.homeTeam?.abbrev}-${g.startTimeUTC}`;
+    const away = g.awayTeam?.abbrev || g.away || g.visitorTeam?.abbrev || "AWY";
+    const home = g.homeTeam?.abbrev || g.home || g.homeTeamAbbrev || "HOM";
+    const startUTC =
+      g.startTimeUTC || g.gameDate || g.startTime || g.startUTC || null;
+    const state = g.gameState || g.state || "FUT";
+    if (id && away && home && startUTC) {
+      out.push({ id, away, home, startUTC, state });
+    }
+  }
+  return out;
+}
+
+// ====== BUILDER MESSAGE (simple, prêt à enrichir) ======
+function buildPrematchMessage(g) {
+  const startParis = formatParis(toParisDate(g.startUTC));
+  return `[DISCORD:NHL] 🏒 SmartScout — Pré-match (auto)
+${g.away} @ ${g.home} — **${startParis} (Paris)**
+Fenêtre ~6h activée. (id: ${g.id})`;
+}
+
+// ====== LOGIQUE PRÉ-MATCH ======
+async function generatePrematchDiscord(opts = {}) {
+  const force = Boolean(opts.force);
   const now = nowParis();
+
+  // 1) Planning jour Paris
   const games = await getScheduleParisDay(now);
-  if (!games.length) return { ok: false, reason: "No games today" };
+  if (!games.length) {
+    return { ok: true, sent: false, reason: "No games today" };
+  }
 
-  // calculs heures Paris
-  const withParis = games.map(g => ({
-    ...g,
-    startParis: new Date(g.startUTC).toLocaleString("en-US", {
-      timeZone: "Europe/Paris",
-    }),
-  }));
-  withParis.sort((a, b) => new Date(a.startParis) - new Date(b.startParis));
+  // 2) StartParis + tri
+  const withParis = games
+    .map((g) => ({
+      ...g,
+      startParis: toParisDate(g.startUTC),
+    }))
+    .sort((a, b) => a.startParis - b.startParis);
 
+  // 3) Fenêtre par rapport au 1er engagement
   const first = withParis[0];
   const minToFirst = diffMin(first.startParis, now);
   const windowOk = minToFirst <= FIRST_WINDOW_MIN;
 
-  console.log(`[${now}] Premier puck ${first.away}@${first.home} dans ${minToFirst} min`);
-
-  if (!windowOk)
-    return { ok: true, sent: false, reason: `first puck in ${minToFirst} min` };
-
-  // Fenêtre <90 min -> Envoi
-  if (minToFirst <= PREMATCH_TRIGGER_MIN) {
-    const nextGames = withParis.filter(
-      g => diffMin(g.startParis, now) <= FIRST_WINDOW_MIN
-    );
-    const list = nextGames
-      .map(
-        g =>
-          `• ${g.away} @ ${g.home} — ${new Date(g.startParis)
-            .toLocaleTimeString("fr-FR", {
-              timeZone: "Europe/Paris",
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-            .replace(":", "h")} (Paris)`
-      )
-      .join("\n");
-
-    const msg = {
-      content: `[DISCORD:NHL] 🕓 SmartScout — Pré-match NHL (auto)\nFenêtre ~6h à partir de ${new Date(
-        first.startParis
-      ).toLocaleTimeString("fr-FR", {
-        timeZone: "Europe/Paris",
-        hour: "2-digit",
-        minute: "2-digit",
-      })} (Paris)\n\n${list}`,
+  if (!windowOk && !force) {
+    return {
+      ok: true,
+      sent: false,
+      reason: `first puck in ${minToFirst} min (outside 90-min window)`,
     };
-
-    await postToDiscord(msg);
-    console.log(`[${now}] Pré-match envoyé (${nextGames.length} matchs).`);
-    return { ok: true, sent: true, count: nextGames.length };
-  } else {
-    console.log(`[${now}] Fenêtre pas encore ouverte (${minToFirst} min).`);
-    return { ok: true, sent: false, reason: `Too early (${minToFirst}min)` };
   }
+
+  // 4) Sélection des matchs qui démarrent dans ~6h (si force → toute la journée +/- 30min)
+  const target = withParis.filter((g) => {
+    const dt = diffMin(g.startParis, now);
+    return force ? dt >= -30 && dt <= 24 * 60 : dt >= 0 && dt <= H6;
+  });
+
+  if (!target.length) {
+    return { ok: true, sent: false, reason: "No games within window" };
+  }
+
+  // 5) Envois Discord
+  let sentCount = 0;
+  const details = [];
+  for (const g of target) {
+    const msg = buildPrematchMessage(g);
+    await postToDiscord({ content: msg });
+    sentCount++;
+    details.push({
+      away: g.away,
+      home: g.home,
+      startParis: formatParis(g.startParis),
+      minToStart: diffMin(g.startParis, now),
+    });
+  }
+
+  return { ok: true, sent: true, count: sentCount, details };
 }
 
-// ========= ROUTES =========
+// ====== ROUTES ======
 
-// route ping simple
+// Sanity check
 app.get("/ping", (_req, res) => res.send("pong"));
 
-// route manuelle de test
-app.get("/test/prematch", async (_req, res) => {
-  await postToDiscord({
-    content:
-      "[DISCORD:NHL] 🔵 SmartScout — Simulation pré-match NHL TEST\nMatch test : Maple Leafs @ Canadiens\nHeure : 01h00 (Europe/Paris)\nAnalyse : Toronto domine en xG et PP, Montréal peine en PK.\nTendance : Victoire Leafs ♦ Over 6.5 ♦ Matthews buteur.\nConfiance globale SmartScout : 81/100",
-  });
-  res.send("Pré-match envoyé sur Discord ✅");
-});
-
-// route auto/force
+// Force immédiat (bypass fenêtre 90 min)
 app.get("/prematch/force", async (_req, res) => {
-  const result = await generatePrematchDiscord();
-  res.json(result);
+  try {
+    const out = await generatePrematchDiscord({ force: true });
+    res.status(200).json({ ok: true, ...out, forced: true });
+  } catch (err) {
+    console.error("Force prematch error:", err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
 });
 
-// ========= BOUCLE AUTO =========
-setInterval(() => {
-  generatePrematchDiscord().catch(err =>
-    console.error("Erreur auto-check:", err.message)
-  );
-}, 60 * 60 * 1000); // chaque heure
-
-// ========= KEEPALIVE + WARM-UP =========
-app.get("/", (_req, res) => res.send("SmartScout NHL autobot OK"));
-
-// ping interne pour éviter le 502 au réveil
-setTimeout(
-  () =>
-    fetch(`http://localhost:${process.env.PORT || 3000}/ping`).catch(() => {}),
-  2000
-);
-setTimeout(
-  () =>
-    fetch(`http://localhost:${process.env.PORT || 3000}/ping`).catch(() => {}),
-  8000
-);
-
-// ========= LISTEN PORT =========
-const PORT = parseInt(process.env.PORT || "3000", 10);
-app.listen(PORT, () => {
-  console.log(`SmartScout NHL autobot up on ${PORT}`);
+// Respecte la fenêtre (≤ 90min avant 1er puck)
+app.get("/prematch/cron", async (_req, res) => {
+  try {
+    const out = await generatePrematchDiscord({ force: false });
+    res.status(200).json({ ok: true, ...out, cron: true });
+  } catch (err) {
+    console.error("Cron prematch error:", err);
+    res.status(500).json({ ok: false, error: String(err) });
+  }
 });
+
+// Petit POST générique pour tester l’acheminement Discord
+app.post("/post", async (req, res) => {
+  try {
+    const { content } = req.body || {};
+    await postToDiscord({ content: content ?? "[DISCORD:NHL] relay test" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /post error:", e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// ====== SCHEDULER (facultatif) ======
+// Lance chaque minute; déclenche à mm===0 entre 16h–23h Paris
+setInterval(async () => {
+  try {
+    const d = nowParis();
+    const parisHour = toParisDate(d).getHours(); // heure Paris
+    const minutes = toParisDate(d).getMinutes();
+
+    if (minutes === 0 && parisHour >= 16 && parisHour <= 23) {
+      console.log(`[${new Date().toISOString()}] Tick horaire → /prematch/cron`);
+      await generatePrematchDiscord({ force: false });
+    }
+  } catch (e) {
+    console.error("Scheduler error:", e);
+  }
+}, 60 * 1000);
+
+// ====== START ======
+app.listen(PORT, () =>
+  console.log(`SmartScout NHL autobot up on ${PORT}`)
+);
