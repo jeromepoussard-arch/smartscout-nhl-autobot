@@ -1,228 +1,236 @@
-// index.js — SmartScout NHL autobot (Render/Web Service)
-// Runtime: Node 18+  |  Start: `node index.js`
-
+// index.js
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-// ====== ENV ======
-const NHL_HOOK = process.env.DISCORD_WEBHOOK_NHL; // <-- ton webhook Discord Render
-if (!NHL_HOOK) {
-  console.warn("⚠️ DISCORD_WEBHOOK_NHL manquant dans Render.");
-}
+// ---------- CONFIG ----------
+const NHL_HOOK = process.env.DISCORD_WEBHOOK_NHL; // à définir dans Render
+const FIRST_WINDOW_MIN = 90;        // fenêtre avant 1er engagement
+const LOOKAHEAD_HOURS = 6;          // matches couverts dans ~6h
+const SCHED_HOURS = { start: 16, end: 23 }; // créneau auto (Paris)
 
-// ====== UTILS ======
-function nowParisDate() {
+// ---------- OUTILS TEMPS ----------
+function nowParis() {
   return new Date();
 }
-function fmtParis(d) {
+function toParisString(d) {
   return d.toLocaleString("fr-FR", { timeZone: "Europe/Paris" });
 }
-function ymdParis(d) {
-  const s = fmtParis(d);
-  const [date] = s.split(",");
-  const [dd, mm, yyyy] = date.split("/");
-  return `${yyyy}-${mm}-${dd}`;
+function parisHours(d) {
+  return Number(
+    d.toLocaleString("en-CA", {
+      timeZone: "Europe/Paris",
+      hour12: false,
+      hour: "2-digit",
+    })
+  );
 }
-function diffMinSigned(targetDate, nowDate) {
-  return Math.round((targetDate.getTime() - nowDate.getTime()) / 60000);
+function diffMin(a, b) {
+  return Math.round((a.getTime() - b.getTime()) / 60000);
 }
 
-// ====== NHL SCHEDULE (version stable) ======
-// Source : https://statsapi.web.nhl.com/api/v1/schedule?date=YYYY-MM-DD
+// ---------- NHL SCHEDULE (Render-compatible) ----------
 async function fetchNhlSchedule(dateStr) {
-  const url = `https://statsapi.web.nhl.com/api/v1/schedule?date=${dateStr}`;
+  // Utilise l'API CDN de la NHL (fiable sur Render free)
+  const url = `https://api.nhle.com/stats/rest/en/schedule?cayenneExp=gameDate%3E=%22${dateStr}%22%20and%20gameDate%3C=%22${dateStr}%22`;
   const res = await fetch(url, { timeout: 15000 });
   if (!res.ok) throw new Error(`NHL schedule HTTP ${res.status}`);
   const json = await res.json();
 
-  const games = json.dates?.[0]?.games || [];
-  return games.map(g => ({
-    id: g.gamePk,
-    away: g.teams?.away?.team?.abbreviation || g.teams?.away?.team?.name || "AWY",
-    home: g.teams?.home?.team?.abbreviation || g.teams?.home?.team?.name || "HOME",
-    startUTC: g.gameDate,
-    startDate: new Date(g.gameDate),
-    startParis: new Date(g.gameDate).toLocaleString("fr-FR", { timeZone: "Europe/Paris" }),
-    state: g.status?.abstractGameState || "FUT",
-  }));
+  const games = json?.data || [];
+  return games.map((g) => {
+    const startUTC = g.gameDate; // ISO
+    const startDate = new Date(startUTC);
+    return {
+      id: g.gameId,
+      away: g.awayTeamAbbrev || g.awayTeamName,
+      home: g.homeTeamAbbrev || g.homeTeamName,
+      startUTC,
+      startDate,
+      startParis: toParisString(startDate),
+      state: "FUT",
+    };
+  });
 }
 
-async function getScheduleParisDay(now = nowParisDate()) {
-  const dateStr = ymdParis(now);
-  const games = await fetchNhlSchedule(dateStr);
-  return games;
+async function getScheduleParisDay(dateObj) {
+  // date format YYYY-MM-DD en Europe/Paris
+  const y = dateObj
+    .toLocaleString("en-CA", { timeZone: "Europe/Paris", year: "numeric" })
+    .padStart(4, "0");
+  const m = dateObj
+    .toLocaleString("en-CA", { timeZone: "Europe/Paris", month: "2-digit" })
+    .padStart(2, "0");
+  const d = dateObj
+    .toLocaleString("en-CA", { timeZone: "Europe/Paris", day: "2-digit" })
+    .padStart(2, "0");
+
+  return await fetchNhlSchedule(`${y}-${m}-${d}`);
 }
 
-// ====== DISCORD ======
+// ---------- DISCORD ----------
 async function postToDiscord(payload) {
-  if (!NHL_HOOK) {
-    console.error("Discord webhook manquant.");
-    return { ok: false, reason: "noWebhook" };
-  }
-  try {
-    const res = await fetch(NHL_HOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) throw new Error(`Discord ${res.status}`);
-    return { ok: true };
-  } catch (err) {
-    console.error("Erreur Discord:", err.message);
-    return { ok: false, reason: err.message };
-  }
+  if (!NHL_HOOK) throw new Error("DISCORD_WEBHOOK_NHL manquant");
+  const res = await fetch(NHL_HOOK, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Discord: ${res.status}`);
 }
 
-// ====== FENÊTRE “PROCHAIN PUCK” ======
-const sentStarts = new Set();
+// ---------- LOGIQUE PRÉ-MATCH ----------
+function windowAndGames(games, now, firstWindowMin, lookaheadHours) {
+  if (!games.length) {
+    return {
+      ok: false,
+      windowOk: false,
+      reason: "No games today",
+    };
+  }
 
-function pickNextWindow(games, now) {
-  const upcoming = games
-    .filter(g => g.startDate.getTime() >= now.getTime() - 15 * 60 * 1000)
-    .sort((a, b) => a.startDate - b.startDate);
+  // tri heure Paris
+  const sorted = games
+    .map((g) => ({
+      ...g,
+      parisDate: new Date(g.startUTC),
+    }))
+    .sort((a, b) => a.parisDate - b.parisDate);
 
-  const next = upcoming[0];
-  if (!next) return { windowOk: false, reason: "noUpcoming" };
+  const first = sorted[0];
+  const minToFirst = diffMin(first.parisDate, now);
+  const windowOk = minToFirst <= firstWindowMin && minToFirst >= -10; // tolérance post coup d'envoi
+  const lastWindow = new Date(now.getTime() + lookaheadHours * 3600 * 1000);
 
-  const minToNext = diffMinSigned(next.startDate, now);
-  const inSixHours = minToNext <= 360;
-  const inWindow = minToNext >= 0 && minToNext <= 90;
-  const notSentYet = !sentStarts.has(next.startUTC);
+  const within = sorted.filter(
+    (g) => g.parisDate <= lastWindow && diffMin(g.parisDate, now) >= -10
+  );
 
   return {
-    windowOk: inWindow && inSixHours && notSentYet,
-    reason: inWindow ? (notSentYet ? "ok" : "alreadySentThisStart") : "outsideWindow",
-    minToNext,
-    nextGame: next,
+    ok: true,
+    windowOk,
+    reason: windowOk ? "ok" : "windowClosedOrNotOpened",
+    minToFirst,
+    first,
+    count: sorted.length,
+    inWindowCount: within.length,
+    within,
   };
 }
 
-// ====== MESSAGE BUILDER ======
-function buildPrematchMessage(gamesWindow, now) {
-  const lines = [];
-  const within6h = gamesWindow
-    .filter(g => {
-      const m = diffMinSigned(g.startDate, now);
-      return m >= 0 && m <= 360;
-    })
-    .sort((a, b) => a.startDate - b.startDate)
-    .map(g => `• ${g.away} @ ${g.home} — ${g.startParis} (Paris)`);
+function buildPrematchMessage(within, firstParisHuman) {
+  const header =
+    "[DISCORD:NHL] 🕑 SmartScout — Pré-match NHL (auto)\n" +
+    `Fenêtre ~${LOOKAHEAD_HOURS}h à partir de ${firstParisHuman} (Paris)\n`;
 
-  if (within6h.length === 0) {
-    lines.push("_Aucun match dans la fenêtre ~6h._");
-  } else {
-    lines.push("Fenêtre ~6h à partir de maintenant (Paris):");
-    lines.push(...within6h);
-  }
+  const lines = within.map(
+    (g) => `• ${g.away} @ ${g.home} — ${toParisString(new Date(g.startUTC))} (Paris)`
+  );
 
-  const header = `[DISCORD:NHL] ⏰ SmartScout — Pré-match NHL (auto)`;
-  return `${header}\n${lines.join("\n")}`;
+  return header + (lines.length ? "\n" + lines.join("\n") : "\n(aucun match dans la fenêtre)");
 }
 
-// ====== ROUTES ======
-app.get("/ping", (_req, res) => res.send("pong"));
+async function generatePrematchDiscord() {
+  try {
+    const now = nowParis();
+    const games = await getScheduleParisDay(now);
+
+    const diag = windowAndGames(
+      games,
+      now,
+      FIRST_WINDOW_MIN,
+      LOOKAHEAD_HOURS
+    );
+
+    if (!diag.ok) {
+      return { ok: true, sent: false, reason: diag.reason, diag };
+    }
+
+    if (!diag.windowOk) {
+      return {
+        ok: true,
+        sent: false,
+        reason: "first puck not within window",
+        diag,
+      };
+    }
+
+    const msg = buildPrematchMessage(diag.within, toParisString(now));
+    await postToDiscord({ content: msg });
+    return { ok: true, sent: true, diag };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+// ---------- ROUTES ----------
+app.get("/ping", (_req, res) => res.type("text").send("pong"));
 
 app.post("/post", async (req, res) => {
-  const payload = req.body && typeof req.body === "object" ? req.body : { content: String(req.body || "") };
-  const r = await postToDiscord(payload);
-  res.json({ ok: r.ok });
+  try {
+    await postToDiscord(req.body);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
+// Diagnostic : explique pourquoi ça enverrait/ne n’enverrait pas
 app.get("/prematch/why", async (_req, res) => {
   try {
-    const now = nowParisDate();
+    const now = nowParis();
     const games = await getScheduleParisDay(now);
-    const window = pickNextWindow(games, now);
-
+    const diag = windowAndGames(
+      games,
+      now,
+      FIRST_WINDOW_MIN,
+      LOOKAHEAD_HOURS
+    );
     res.json({
       ok: true,
-      nowParis: fmtParis(now),
-      diag: {
-        count: games.length,
-        minToNext: window.minToNext ?? null,
-        windowOk: window.windowOk,
-        reason: window.reason,
-        next: window.nextGame
-          ? { away: window.nextGame.away, home: window.nextGame.home, startParis: window.nextGame.startParis, startUTC: window.nextGame.startUTC }
-          : null,
-      },
+      cron: true,
+      nowParis: toParisString(now),
+      diag,
     });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+// Force un envoi immédiat si fenêtre ouverte
 app.get("/prematch/force", async (_req, res) => {
-  try {
-    const now = nowParisDate();
-    const games = await getScheduleParisDay(now);
-    const msg = buildPrematchMessage(games, now);
-    const r = await postToDiscord({ content: msg });
-    if (r.ok) {
-      return res.json({ ok: true, sent: true });
-    }
-    res.status(500).json({ ok: false, sent: false, reason: r.reason });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
+  const r = await generatePrematchDiscord();
+  res.json(r);
 });
 
+// Simule le cron (déclenche la logique auto)
 app.get("/cron/manual", async (_req, res) => {
-  try {
-    const now = nowParisDate();
-    const games = await getScheduleParisDay(now);
-    const window = pickNextWindow(games, now);
-
-    if (window.windowOk) {
-      const msg = buildPrematchMessage(games, now);
-      const r = await postToDiscord({ content: msg });
-      if (r.ok) {
-        sentStarts.add(window.nextGame.startUTC);
-        return res.json({ ok: true, cron: true, sent: true, nextStartUTC: window.nextGame.startUTC, minToNext: window.minToNext });
-      }
-      return res.status(500).json({ ok: false, cron: true, sent: false, reason: r.reason });
-    } else {
-      return res.json({
-        ok: true,
-        cron: true,
-        sent: false,
-        reason: window.reason,
-        minToNext: window.minToNext ?? null,
-      });
-    }
-  } catch (err) {
-    res.status(500).json({ ok: false, cron: true, error: err.message });
-  }
+  const r = await generatePrematchDiscord();
+  res.json(r);
 });
 
-// ====== CRON TICK ======
-async function cronTick() {
-  try {
-    const now = nowParisDate();
-    const games = await getScheduleParisDay(now);
-    const window = pickNextWindow(games, now);
-
-    if (window.windowOk) {
-      const msg = buildPrematchMessage(games, now);
-      const r = await postToDiscord({ content: msg });
-      if (r.ok) {
-        sentStarts.add(window.nextGame.startUTC);
-        console.log(`[${fmtParis(now)}] Pré-match auto envoyé ✅ pour ${window.nextGame.away}@${window.nextGame.home} (T-${window.minToNext}m)`);
-      } else {
-        console.log(`[${fmtParis(now)}] Discord error: ${r.reason}`);
-      }
+// ---------- SCHEDULER ----------
+function tick() {
+  const now = nowParis();
+  const hr = parisHours(now);
+  if (hr >= SCHED_HOURS.start && hr <= SCHED_HOURS.end) {
+    // exécute à la minute *pile*
+    const min = now.getUTCMinutes(); // minute réelle suffira
+    if (min % 1 === 0) {
+      generatePrematchDiscord().then((r) =>
+        console.log(
+          `[${toParisString(now)}] cron tick => sent=${r.sent || false} reason=${r.reason || "ok"}`
+        )
+      );
     }
-  } catch (err) {
-    console.error("cronTick error:", err.message);
   }
 }
-setInterval(cronTick, 60 * 1000);
+setInterval(tick, 60 * 1000);
 
-// ====== SERVER ======
+// ---------- START ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`SmartScout NHL autobot up on ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`SmartScout NHL autobot up on ${PORT}`)
+);
